@@ -3,10 +3,7 @@
 Training script for Fretting-Transformer using Hydra configuration.
 """
 
-import os
 from pathlib import Path
-from glob import glob
-import json
 import random
 import numpy as np
 import torch
@@ -16,16 +13,14 @@ from tqdm import tqdm
 import hydra
 from transformers.modeling_outputs import Seq2SeqLMOutput
 from omegaconf import DictConfig, OmegaConf
-from functools import partial
 
 from src.tab_dataset import TabDataset
 from src.model import FrettingTransformer
-from src.metrics import generate_and_compute_accuracy
+from src.metrics import TabAccuracyMetrics, generate_and_compute_accuracy
 from src.dataloader import create_dataset, create_dataloader
 from src.training_logger import TrainingLogger, save_generated_samples
 
 
-from typing_extensions import TypeAlias
 from src.tab_dataset import TabDatasetBatchInput
 
 
@@ -450,12 +445,36 @@ def main(cfg: DictConfig):
     # Modify 2026-03-15: unpack (optimizer, scheduler) tuple
     # optimizer, scheduler = create_optimizer(model, cfg)
 
+    # =========================================================================
+    # CHECKPOINT RESUMPTION LOGIC
+    # =========================================================================
+    start_epoch = 1
+    resume_path = cfg.get("checkpoint_path", None)
+    if resume_path is None and "training" in cfg:
+        resume_path = cfg.training.get("resume_checkpoint", None)
+
+    if resume_path:
+        resume_file = Path(resume_path)
+        if resume_file.exists():
+            print(f"\nLoading checkpoint from: {resume_file}")
+            checkpoint = torch.load(resume_file, map_location=device)
+            if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
+                model.load_state_dict(checkpoint["model_state_dict"])
+                if "optimizer_state_dict" in checkpoint and optimizer is not None:
+                    optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+                if "epoch" in checkpoint:
+                    start_epoch = checkpoint["epoch"] + 1
+                print(f"Successfully resumed from epoch {start_epoch - 1}")
+        else:
+            print(f"\nWarning: Checkpoint not found at {resume_file}. Starting from scratch.")
+    # =========================================================================
+
     # Training loop
     print("\nStarting training...")
     best_val_loss = float("inf")
     best_tab_accuracy = 0.0
 
-    for epoch in range(1, cfg.training.num_epochs + 1):
+    for epoch in range(start_epoch, cfg.training.num_epochs + 1):
         print(f"\n{'=' * 80}")
         print(f"Epoch {epoch}/{cfg.training.num_epochs}")
         print(f"{'=' * 80}")
@@ -481,7 +500,11 @@ def main(cfg: DictConfig):
         if cfg.training.get('ar_eval_enabled', False) and cfg.training.get('ar_eval_frequency', 0) > 0:
             if epoch % cfg.training.ar_eval_frequency == 0:
                 print(f"\nRunning AR evaluation (generation + accuracy)...")
-                ar_metrics, (input_ids, targets, predictions) = generate_and_compute_accuracy(
+                ar_metrics: TabAccuracyMetrics | None = None
+                _input_ids: torch.Tensor | None = None
+                targets: torch.Tensor | None = None
+                predictions: torch.Tensor | None = None
+                ar_metrics, _input_ids, targets, predictions = generate_and_compute_accuracy(
                     model=model,
                     dataloader=val_loader,
                     output_vocab=dataset.output_vocab,
@@ -497,11 +520,14 @@ def main(cfg: DictConfig):
                 
                 current_tab_accuracy = ar_metrics.tab_accuracy
 
-                # Save generated samples
+                # Save generated samples safely
+                preds_np = predictions.cpu().numpy() if hasattr(predictions, 'cpu') else predictions
+                targets_np = targets.cpu().numpy() if hasattr(targets, 'cpu') else targets
+                
                 samples_file = output_dir / f"generated_samples_epoch_{epoch}.json"
                 save_generated_samples(
-                    predictions=predictions.cpu().numpy(),
-                    targets=targets.cpu().numpy(),
+                    predictions=preds_np,
+                    targets=targets_np,
                     output_vocab=dataset.output_vocab,
                     output_file=samples_file,
                     max_samples=10
@@ -521,7 +547,7 @@ def main(cfg: DictConfig):
         # Save best checkpoint based on validation loss
         if val_loss < best_val_loss:
             best_val_loss = val_loss
-            checkpoint_path = output_dir / "best_model.pt"
+            checkpoint_path_out = output_dir / "best_model.pt"
             torch.save(
                 {
                     "epoch": epoch,
@@ -531,9 +557,9 @@ def main(cfg: DictConfig):
                     "val_loss": val_loss,
                     "config": OmegaConf.to_container(cfg),
                 },
-                checkpoint_path,
+                checkpoint_path_out,
             )
-            print(f"Saved best model to {checkpoint_path}")
+            print(f"Saved best model to {checkpoint_path_out}")
         
         # Save best checkpoint based on AR tab accuracy
         # if current_tab_accuracy is not None and current_tab_accuracy > best_tab_accuracy:
@@ -557,7 +583,7 @@ def main(cfg: DictConfig):
         # Save checkpoint every N epochs
         checkpoint_every_n = cfg.training.get('checkpoint_every_n_epochs', 0)
         if checkpoint_every_n > 0 and epoch % checkpoint_every_n == 0:
-            checkpoint_path = output_dir / f"checkpoint_epoch_{epoch}.pt"
+            checkpoint_path_out = output_dir / f"checkpoint_epoch_{epoch}.pt"
             torch.save(
                 {
                     "epoch": epoch,
@@ -567,9 +593,9 @@ def main(cfg: DictConfig):
                     "val_loss": val_loss,
                     "config": OmegaConf.to_container(cfg),
                 },
-                checkpoint_path,
+                checkpoint_path_out,
             )
-            print(f"Saved checkpoint to {checkpoint_path}")
+            print(f"Saved checkpoint to {checkpoint_path_out}")
 
     # Final evaluation on test set
     print("\n" + "=" * 80)
@@ -594,7 +620,7 @@ def main(cfg: DictConfig):
     # Final AR evaluation on test set
     if cfg.training.get('ar_eval_enabled', False):
         print(f"\nFinal AR evaluation on test set...")
-        test_ar_metrics, (input_ids, targets, predictions) = generate_and_compute_accuracy(
+        test_ar_metrics, input_ids, targets, predictions = generate_and_compute_accuracy(
             model=model,
             dataloader=test_loader,
             output_vocab=dataset.output_vocab,
@@ -615,14 +641,17 @@ def main(cfg: DictConfig):
         print(f"  Tab Accuracy:    {test_ar_metrics.tab_accuracy:.2%}")
         print(f"  Difficulty:        {test_ar_metrics.difficulty:.2f}")
 
-        # Save final test generated samples
+        # Save final test generated samples safely
+        preds_np = predictions.cpu().numpy() if hasattr(predictions, 'cpu') else predictions
+        targets_np = targets.cpu().numpy() if hasattr(targets, 'cpu') else targets
+        
         samples_file = output_dir / "test_generated_samples.json"
         save_generated_samples(
-            predictions=predictions.cpu().numpy(),
-            targets=targets.cpu().numpy(),
+            predictions=preds_np,
+            targets=targets_np,
             output_vocab=dataset.output_vocab,
             output_file=samples_file,
-            max_samples=20  # Save more samples for final test
+            max_samples=20
         )
 
         # Log test AR eval to history
